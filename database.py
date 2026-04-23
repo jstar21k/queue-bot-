@@ -1,6 +1,5 @@
 """
 MongoDB database module for Queue Bot.
-Manages posts collection and current state tracking.
 """
 
 import logging
@@ -24,13 +23,6 @@ class DatabaseConnectionError(RuntimeError):
 
 
 class DatabaseManager:
-    """
-    Manages MongoDB operations for the queue bot.
-    Collections:
-    - posts: stores individual posts with status
-    - state: stores current bot state (single document)
-    """
-
     def __init__(self, config: BotConfig):
         client_options = self._build_client_options(config.mongo_uri)
         self.client = MongoClient(config.mongo_uri, **client_options)
@@ -74,39 +66,32 @@ class DatabaseManager:
             client_options["tlsCAFile"] = certifi.where()
             logger.info("Using certifi CA bundle for MongoDB TLS")
 
-        # Fix for Railway + Atlas TLS issues: Add TLS minimum version
-        if is_atlas_uri:
-            client_options["tlsMinVersion"] = "TLSv1.2"
-            # If still failing, uncomment this line:
-            # client_options["tlsAllowInvalidCertificates"] = True
-
         return client_options
 
     def _format_connection_error(self, mongo_uri: str, exc: Exception) -> str:
-        """Return an actionable startup error message for MongoDB failures."""
         exc_text = str(exc)
         lowered = exc_text.lower()
 
         if "ssl handshake failed" in lowered or "certificate_verify_failed" in lowered or "tlsv1" in lowered:
             return (
-                "MongoDB TLS handshake failed. The bot is using certifi for CA validation, "
-                "so if this still fails, verify that MONGO_URI is the exact Atlas/Railway URI "
-                "and that your MongoDB provider allows connections from Railway. "
-                "For Railway + Atlas issues, try adding '?tls=true&tlsMinVersion=TLSv1.2' to the URI. "
+                "MongoDB TLS handshake failed. "
+                "IMPORTANT: Add TLS parameters to your MONGO_URI:\n"
+                "Example: mongodb+srv://user:pass@cluster.mongodb.net/db?tls=true&tlsminversion=TLSv1_2\n"
                 "Original error: " + exc_text
             )
 
         if "mongodb.net" in mongo_uri.lower():
             return (
-                "Could not connect to MongoDB Atlas. Check that MONGO_URI is copied exactly "
-                "from Atlas (prefer the mongodb+srv URI) and that network access is allowed. "
+                "Could not connect to MongoDB Atlas. Check that:\n"
+                "1. MONGO_URI is copied exactly from Atlas\n"
+                "2. Network access allows Railway IPs\n"
+                "3. Add ?tls=true to the URI\n"
                 f"Original error: {exc_text}"
             )
 
         return f"Could not connect to MongoDB. Original error: {exc_text}"
 
     def _ensure_indexes(self):
-        """Create indexes for efficient queries."""
         self.posts.create_index([("created_at", 1)])
         self.posts.create_index([("status", 1)])
         self.posts.create_index([("intake_message_ids", 1)], unique=True, sparse=True)
@@ -133,10 +118,7 @@ class DatabaseManager:
         return str(result.inserted_id)
 
     def get_oldest_queued(self) -> Optional[Dict[str, Any]]:
-        return self.posts.find_one(
-            {"status": "queued"},
-            sort=[("created_at", 1)]
-        )
+        return self.posts.find_one({"status": "queued"}, sort=[("created_at", 1)])
 
     def get_post_by_id(self, post_id: str) -> Optional[Dict[str, Any]]:
         from bson import ObjectId
@@ -144,30 +126,17 @@ class DatabaseManager:
 
     def mark_sent(self, post_id: str, storage_message_ids: Optional[List[int]] = None) -> bool:
         from bson import ObjectId
-        update_data = {
-            "status": "sent",
-            "sent_at": datetime.now(timezone.utc),
-            "updated_at": datetime.now(timezone.utc)
-        }
+        update_data = {"status": "sent", "sent_at": datetime.now(timezone.utc), "updated_at": datetime.now(timezone.utc)}
         if storage_message_ids:
             update_data["storage_message_ids"] = storage_message_ids
-
-        result = self.posts.update_one(
-            {"_id": ObjectId(post_id)},
-            {"$set": update_data}
-        )
+        result = self.posts.update_one({"_id": ObjectId(post_id)}, {"$set": update_data})
         return result.modified_count > 0
 
     def update_storage_message_ids(self, post_id: str, storage_message_ids: List[int]) -> bool:
         from bson import ObjectId
         result = self.posts.update_one(
             {"_id": ObjectId(post_id)},
-            {
-                "$set": {
-                    "storage_message_ids": storage_message_ids,
-                    "updated_at": datetime.now(timezone.utc)
-                }
-            }
+            {"$set": {"storage_message_ids": storage_message_ids, "updated_at": datetime.now(timezone.utc)}}
         )
         return result.modified_count > 0
 
@@ -175,13 +144,7 @@ class DatabaseManager:
         from bson import ObjectId
         result = self.posts.update_one(
             {"_id": ObjectId(post_id)},
-            {
-                "$set": {
-                    "status": "done",
-                    "done_at": datetime.now(timezone.utc),
-                    "updated_at": datetime.now(timezone.utc)
-                }
-            }
+            {"$set": {"status": "done", "done_at": datetime.now(timezone.utc), "updated_at": datetime.now(timezone.utc)}}
         )
         return result.modified_count > 0
 
@@ -196,31 +159,17 @@ class DatabaseManager:
     def get_state(self) -> Dict[str, Any]:
         state = self.state.find_one({"_id": "current"})
         if not state:
-            state = {
-                "_id": "current",
-                "current_post_id": None,
-                "waiting_for_done": False,
-                "last_check_time": None,
-                "updated_at": datetime.now(timezone.utc)
-            }
+            state = {"_id": "current", "current_post_id": None, "waiting_for_done": False, "last_check_time": None, "updated_at": datetime.now(timezone.utc)}
             self.state.insert_one(state)
         return state
 
-    def update_state(self,
-                     current_post_id: Optional[str] = None,
-                     waiting_for_done: Optional[bool] = None) -> None:
+    def update_state(self, current_post_id: Optional[str] = None, waiting_for_done: Optional[bool] = None) -> None:
         update = {"updated_at": datetime.now(timezone.utc)}
-
         if current_post_id is not None:
             update["current_post_id"] = current_post_id
-
         if waiting_for_done is not None:
             update["waiting_for_done"] = waiting_for_done
-
-        self.state.update_one(
-            {"_id": "current"},
-            {"$set": update}
-        )
+        self.state.update_one({"_id": "current"}, {"$set": update})
 
     def clear_current_post(self) -> None:
         self.update_state(current_post_id=None, waiting_for_done=False)
@@ -228,14 +177,8 @@ class DatabaseManager:
     def set_waiting(self, post_id: str) -> None:
         self.update_state(current_post_id=post_id, waiting_for_done=True)
 
-    # ==================== UTILITY ====================
-
     def close(self):
         self.client.close()
 
     def get_queue_stats(self) -> Dict[str, int]:
-        return {
-            "queued": self.count_by_status("queued"),
-            "sent": self.count_by_status("sent"),
-            "done": self.count_by_status("done")
-        }
+        return {"queued": self.count_by_status("queued"), "sent": self.count_by_status("sent"), "done": self.count_by_status("done")}
