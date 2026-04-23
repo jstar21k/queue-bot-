@@ -16,18 +16,20 @@ Supports two intake styles:
 import asyncio
 import logging
 import signal
+import ssl
 import sys
+from contextlib import suppress
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Dict, Any, List, Tuple
 
-from aiogram import Bot, Dispatcher, types, F
+from aiogram import Bot, Dispatcher, F
 from aiogram.client.bot import DefaultBotProperties
 from aiogram.enums import ContentType, ParseMode
 from aiogram.filters import Command
-from aiogram.types import Message, FSInputFile, InputMediaPhoto, InputMediaVideo
+from aiogram.types import Message
 
-from config import get_config, load_config, BotConfig
-from database import DatabaseManager
+from config import load_config, BotConfig
+from database import DatabaseManager, DatabaseConnectionError
 
 # Configure logging
 logging.basicConfig(
@@ -60,9 +62,32 @@ class IntakeHandler:
     def _make_group_key(self, message: Message) -> int:
         """
         Create a group key for pairing messages.
-        Uses message_id which should be sequential for messages sent close together.
+        The first standalone message in a pair becomes the group anchor.
         """
         return message.message_id
+
+    def _find_matching_pair(self, message: Message) -> Optional[int]:
+        """
+        Reuse the newest incomplete pair that can be completed by this message.
+        """
+        content_type = message.content_type
+
+        for key in sorted(self.pending_pairs.keys(), reverse=True):
+            pair = self.pending_pairs[key]
+            other_message = None
+
+            if content_type == ContentType.PHOTO and pair["image"] is None and pair["video"] is not None:
+                other_message = pair["video"]
+            elif content_type == ContentType.VIDEO and pair["video"] is None and pair["image"] is not None:
+                other_message = pair["image"]
+
+            if other_message is None:
+                continue
+
+            if abs(message.message_id - other_message.message_id) <= 5:
+                return key
+
+        return None
 
     async def process_message(self, message: Message) -> bool:
         """
@@ -90,32 +115,35 @@ class IntakeHandler:
         Handle STYLE A: Separate image and video messages.
         Pair messages that arrive close together.
         """
-        group_key = self._make_group_key(message)
+        content_type = message.content_type
 
-        # Initialize or get existing pair
-        if group_key not in self.pending_pairs:
+        # Clean up stale pairs before trying to reuse one.
+        await self._cleanup_old_pairs()
+
+        group_key = self._find_matching_pair(message)
+        if group_key is None:
+            group_key = self._make_group_key(message)
+
             self.pending_pairs[group_key] = {
-                'timestamp': datetime.now(timezone.utc),
-                'image': None,
-                'video': None
+                "timestamp": datetime.now(timezone.utc),
+                "image": None,
+                "video": None,
             }
 
         pair = self.pending_pairs[group_key]
+        pair["timestamp"] = datetime.now(timezone.utc)
 
         # Check if this message completes the pair
         if content_type == ContentType.PHOTO:
-            pair['image'] = message
+            pair["image"] = message
         elif content_type == ContentType.VIDEO:
-            pair['video'] = message
-
-        # Check for timeout (clean up old pairs)
-        await self._cleanup_old_pairs()
+            pair["video"] = message
 
         # Check if we have a complete pair
-        if pair['image'] and pair['video']:
+        if pair["image"] and pair["video"]:
             # Complete post found!
-            image_msg = pair['image']
-            video_msg = pair['video']
+            image_msg = pair["image"]
+            video_msg = pair["video"]
 
             # Determine order (image before video based on message_id)
             if image_msg.message_id > video_msg.message_id:
@@ -267,20 +295,24 @@ class QueueBot:
         dp.message.register(self.cmd_process_next, Command("process_next"))
 
         # Intake channel - all messages
-        dp.message(F.chat.id == int(self.config.intake_channel_id))(
-            self.handle_intake
+        dp.message.register(
+            self.handle_intake,
+            F.chat.id == int(self.config.intake_channel_id),
         )
 
         # Storage channel - monitor for "post done"
-        dp.message(
+        dp.message.register(
+            self.handle_post_done,
             F.chat.id == int(self.config.storage_channel_id),
-            F.text.regexp(r"^post done$")
-        )(self.handle_post_done)
+            F.text.regexp(r"^post done$"),
+        )
 
         # Storage channel - ignore other messages
-        dp.message(F.chat.id == int(self.config.storage_channel_id))(
-            lambda m: m.text != "post done"
-        )(self.ignore_storage_message)
+        dp.message.register(
+            self.ignore_storage_message,
+            F.chat.id == int(self.config.storage_channel_id),
+            lambda message: message.text != "post done",
+        )
 
     # ==================== INTAKE HANDLING ====================
 
@@ -791,19 +823,44 @@ async def main():
         # Load configuration
         config = load_config()
         logger.info("Configuration loaded successfully")
-
-        # Create and start bot
-        bot = QueueBot(config)
-        setup_signal_handlers(bot)
-
-        await bot.start()
+        logger.info(
+            "Runtime info: Python %s | OpenSSL %s",
+            sys.version.split()[0],
+            ssl.OPENSSL_VERSION,
+        )
 
     except ValueError as e:
         logger.error(f"Configuration error: {e}")
         sys.exit(1)
-    except Exception as e:
-        logger.error(f"Bot error: {e}")
-        sys.exit(1)
+
+    retry_delay_seconds = 15
+
+    while True:
+        bot: Optional[QueueBot] = None
+
+        try:
+            # Create and start bot
+            bot = QueueBot(config)
+            setup_signal_handlers(bot)
+            await bot.start()
+            return
+        except DatabaseConnectionError as e:
+            logger.error(f"Database connection error: {e}")
+            logger.info(f"Retrying startup in {retry_delay_seconds} seconds...")
+
+            if bot is not None:
+                with suppress(Exception):
+                    await bot.stop()
+
+            await asyncio.sleep(retry_delay_seconds)
+        except Exception as e:
+            logger.error(f"Bot error: {e}")
+
+            if bot is not None:
+                with suppress(Exception):
+                    await bot.stop()
+
+            sys.exit(1)
 
 
 if __name__ == "__main__":

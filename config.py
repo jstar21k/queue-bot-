@@ -7,6 +7,12 @@ import os
 from dataclasses import dataclass
 from typing import Optional
 
+from dotenv import load_dotenv
+
+
+# Load local .env for development without overriding Railway-provided vars.
+load_dotenv(override=False)
+
 
 @dataclass
 class BotConfig:

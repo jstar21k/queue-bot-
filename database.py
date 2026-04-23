@@ -6,14 +6,21 @@ Manages posts collection and current state tracking.
 import logging
 from datetime import datetime, timezone
 from typing import Optional, List, Dict, Any
+from urllib.parse import parse_qsl, urlsplit
 
+import certifi
 from pymongo import MongoClient
 from pymongo.collection import Collection
 from pymongo.database import Database
+from pymongo.errors import PyMongoError
 
-from config import get_config, BotConfig
+from config import BotConfig
 
 logger = logging.getLogger(__name__)
+
+
+class DatabaseConnectionError(RuntimeError):
+    """Raised when the bot cannot connect to MongoDB at startup."""
 
 
 class DatabaseManager:
@@ -25,13 +32,71 @@ class DatabaseManager:
     """
 
     def __init__(self, config: BotConfig):
-        self.client = MongoClient(config.mongo_uri)
+        client_options = self._build_client_options(config.mongo_uri)
+        self.client = MongoClient(config.mongo_uri, **client_options)
         self.db: Database = self.client[config.db_name]
         self.posts: Collection = self.db["posts"]
         self.state: Collection = self.db["state"]
 
-        # Ensure indexes
-        self._ensure_indexes()
+        try:
+            self.client.admin.command("ping")
+            logger.info("MongoDB connection established successfully")
+            self._ensure_indexes()
+        except PyMongoError as exc:
+            self.close()
+            raise DatabaseConnectionError(
+                self._format_connection_error(config.mongo_uri, exc)
+            ) from exc
+
+    def _build_client_options(self, mongo_uri: str) -> Dict[str, Any]:
+        """Build safe MongoClient options for Atlas and Railway deployments."""
+        uri_options = {
+            key.lower(): value
+            for key, value in parse_qsl(urlsplit(mongo_uri).query, keep_blank_values=True)
+        }
+
+        is_srv_uri = mongo_uri.startswith("mongodb+srv://")
+        is_atlas_uri = "mongodb.net" in mongo_uri.lower()
+        tls_enabled = is_srv_uri or uri_options.get("tls", "").lower() == "true" or uri_options.get("ssl", "").lower() == "true"
+
+        client_options: Dict[str, Any] = {
+            "serverSelectionTimeoutMS": 30000,
+            "connectTimeoutMS": 20000,
+            "socketTimeoutMS": 20000,
+            "appname": "telegram-queue-bot",
+        }
+
+        if is_atlas_uri and "tls" not in uri_options and "ssl" not in uri_options:
+            client_options["tls"] = True
+            tls_enabled = True
+
+        if tls_enabled and "tlscafile" not in uri_options and "ssl_ca_certs" not in uri_options:
+            client_options["tlsCAFile"] = certifi.where()
+            logger.info("Using certifi CA bundle for MongoDB TLS")
+
+        return client_options
+
+    def _format_connection_error(self, mongo_uri: str, exc: Exception) -> str:
+        """Return an actionable startup error message for MongoDB failures."""
+        exc_text = str(exc)
+        lowered = exc_text.lower()
+
+        if "ssl handshake failed" in lowered or "certificate_verify_failed" in lowered or "tlsv1" in lowered:
+            return (
+                "MongoDB TLS handshake failed. The bot is using certifi for CA validation, "
+                "so if this still fails, verify that MONGO_URI is the exact Atlas/Railway URI "
+                "and that your MongoDB provider allows connections from Railway. "
+                f"Original error: {exc_text}"
+            )
+
+        if "mongodb.net" in mongo_uri.lower():
+            return (
+                "Could not connect to MongoDB Atlas. Check that MONGO_URI is copied exactly "
+                "from Atlas (prefer the mongodb+srv URI) and that network access is allowed. "
+                f"Original error: {exc_text}"
+            )
+
+        return f"Could not connect to MongoDB. Original error: {exc_text}"
 
     def _ensure_indexes(self):
         """Create indexes for efficient queries."""
