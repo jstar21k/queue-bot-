@@ -16,6 +16,7 @@ from pymongo.errors import PyMongoError
 from config import BotConfig
 
 logger = logging.getLogger(__name__)
+_UNSET = object()
 
 
 class DatabaseConnectionError(RuntimeError):
@@ -163,11 +164,22 @@ class DatabaseManager:
             self.state.insert_one(state)
         return state
 
-    def update_state(self, current_post_id: Optional[str] = None, waiting_for_done: Optional[bool] = None) -> None:
+    def update_state(self,
+                     current_post_id: Any = _UNSET,
+                     waiting_for_done: Any = _UNSET) -> None:
+        """
+        Update the bot state.
+
+        Args:
+            current_post_id: ID of currently active post (None if none)
+            waiting_for_done: Whether bot is waiting for "post done"
+        """
         update = {"updated_at": datetime.now(timezone.utc)}
-        if current_post_id is not None:
+
+        if current_post_id is not _UNSET:
             update["current_post_id"] = current_post_id
-        if waiting_for_done is not None:
+
+        if waiting_for_done is not _UNSET:
             update["waiting_for_done"] = waiting_for_done
         self.state.update_one({"_id": "current"}, {"$set": update})
 

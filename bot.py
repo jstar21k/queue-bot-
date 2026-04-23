@@ -90,15 +90,9 @@ class IntakeHandler:
         if pair["image"] and pair["video"]:
             image_msg = pair["image"]
             video_msg = pair["video"]
-
-            if image_msg.message_id > video_msg.message_id:
-                message_ids = [video_msg.message_id, image_msg.message_id]
-            else:
-                message_ids = [image_msg.message_id, video_msg.message_id]
-
             del self.pending_pairs[group_key]
             return await self.bot_instance.queue_post(
-                message_ids=message_ids,
+                message_ids=[image_msg.message_id, video_msg.message_id],
                 media_group_id=None
             )
         return False
@@ -124,10 +118,6 @@ class IntakeHandler:
             elif message.content_type == ContentType.VIDEO:
                 group['video_count'] += 1
             group['last_update'] = datetime.now(timezone.utc)
-
-        time_since_update = datetime.now(timezone.utc) - group['last_update']
-        if time_since_update > timedelta(seconds=3):
-            return await self._process_media_group(group_id)
         return False
 
     async def _process_media_group(self, group_id: str) -> bool:
@@ -147,15 +137,9 @@ class IntakeHandler:
 
         image_msg = photos[0]
         video_msg = videos[0]
-
-        if image_msg.message_id < video_msg.message_id:
-            message_ids = [image_msg.message_id, video_msg.message_id]
-        else:
-            message_ids = [video_msg.message_id, image_msg.message_id]
-
         del self.media_groups[group_id]
         return await self.bot_instance.queue_post(
-            message_ids=message_ids,
+            message_ids=[image_msg.message_id, video_msg.message_id],
             media_group_id=group_id
         )
 
@@ -177,6 +161,7 @@ class QueueBot:
         self.dp = Dispatcher()
         self.db = DatabaseManager(config)
         self.intake_handler = IntakeHandler(self)
+        self.media_group_tasks: Dict[str, asyncio.Task[Any]] = {}
         self.sent_time: Optional[datetime] = None
         self.is_running = False
         self._setup_handlers()
@@ -190,22 +175,22 @@ class QueueBot:
         dp.message.register(self.cmd_help, Command("help"))
         dp.message.register(self.cmd_process_next, Command("process_next"))
 
-        # Intake channel - photo and video only
-        dp.message.register(
+        # Intake channel posts arrive as channel_post updates, not message updates.
+        dp.channel_post.register(
             self.handle_intake,
             F.chat.id == int(self.config.intake_channel_id),
             F.content_type.in_([ContentType.PHOTO, ContentType.VIDEO]),
         )
 
-        # Storage channel - "post done" handler
-        dp.message.register(
+        # Storage channel posts also arrive as channel_post updates.
+        dp.channel_post.register(
             self.handle_post_done,
             F.chat.id == int(self.config.storage_channel_id),
             F.text.regexp(r"^post done$"),
         )
 
         # Storage channel - ignore other messages
-        dp.message.register(
+        dp.channel_post.register(
             self.ignore_storage_message,
             F.chat.id == int(self.config.storage_channel_id),
             lambda message: message.text != "post done",
@@ -217,21 +202,39 @@ class QueueBot:
         logger.info(f"Received message in intake: ID={message.message_id}, type={message.content_type}, media_group={message.media_group_id}")
 
         try:
+            result = await self.intake_handler.process_message(message)
+
             if message.media_group_id:
-                asyncio.create_task(self._process_media_group_delayed(message))
+                self._schedule_media_group_processing(message.media_group_id)
+            elif result:
+                logger.info(f"Message {message.message_id} completed a post and was queued")
             else:
-                result = await self.intake_handler.process_message(message)
-                if result:
-                    logger.info(f"Message {message.message_id} completed a post and was queued")
-                else:
-                    logger.info(f"Message {message.message_id} did not complete a post (waiting for pair)")
+                logger.info(f"Message {message.message_id} did not complete a post (waiting for pair)")
         except Exception as e:
             logger.error(f"Error handling intake message: {e}")
 
-    async def _process_media_group_delayed(self, message: Message) -> None:
-        group_id = message.media_group_id
-        await asyncio.sleep(2)
-        await self.intake_handler._process_media_group(group_id)
+    def _schedule_media_group_processing(self, group_id: str) -> None:
+        """Schedule one delayed finalize task per media group."""
+        existing_task = self.media_group_tasks.get(group_id)
+
+        if existing_task and not existing_task.done():
+            return
+
+        self.media_group_tasks[group_id] = asyncio.create_task(
+            self._process_media_group_delayed(group_id)
+        )
+
+    async def _process_media_group_delayed(self, group_id: str) -> None:
+        """Process media group after a short delay to ensure all messages are received."""
+        try:
+            await asyncio.sleep(2)
+            result = await self.intake_handler._process_media_group(group_id)
+            if result:
+                logger.info(f"Media group {group_id} completed a post and was queued")
+            else:
+                logger.info(f"Media group {group_id} was incomplete or invalid")
+        finally:
+            self.media_group_tasks.pop(group_id, None)
 
     async def queue_post(self, message_ids: List[int],
                          media_group_id: Optional[str] = None) -> bool:
@@ -243,9 +246,6 @@ class QueueBot:
             )
             logger.info(f"Post queued: {post_id} (IDs: {message_ids})")
             await self.check_and_send_next()
-
-            if self.config.delete_intake_messages:
-                await self._delete_messages(message_ids)
             return True
         except Exception as e:
             logger.error(f"Failed to queue post: {e}")
@@ -319,6 +319,11 @@ class QueueBot:
             self.db.update_storage_message_ids(post_id, storage_ids)
             self.db.mark_sent(post_id)
             self.db.set_waiting(post_id)
+
+            # Only remove intake messages after the post is safely in Storage.
+            if self.config.delete_intake_messages:
+                await self._delete_messages(next_post.get("intake_message_ids", []))
+
             self.sent_time = datetime.now(timezone.utc)
             logger.info(f"Post {post_id} sent to storage (msgs: {storage_ids}), waiting for confirmation")
             return True
@@ -418,82 +423,16 @@ class QueueBot:
             logger.warning(f"Could not send startup message: {e}")
 
     async def scan_existing_intake_messages(self) -> None:
-        logger.info("Scanning existing Intake Channel messages...")
-
-        try:
-            messages = []
-            try:
-                from aiogram.methods import GetChatHistory
-                request = GetChatHistory(
-                    chat_id=self.config.intake_channel_id,
-                    limit=100
-                )
-                result = await self.bot(request)
-                messages = result.messages
-            except (ImportError, AttributeError):
-                try:
-                    async for msg in self.bot.get_history(
-                        chat_id=self.config.intake_channel_id,
-                        limit=100
-                    ):
-                        messages.append(msg)
-                except AttributeError:
-                    logger.warning("Chat history method not available, skipping scan")
-                    return
-
-            messages.reverse()
-            logger.info(f"Found {len(messages)} messages to scan")
-
-            pending_images: Dict[int, Message] = {}
-            pending_videos: Dict[int, Message] = {}
-
-            for msg in messages:
-                content_type = msg.content_type
-                if content_type not in [ContentType.PHOTO, ContentType.VIDEO]:
-                    continue
-                if msg.media_group_id:
-                    continue
-                if content_type == ContentType.PHOTO:
-                    pending_images[msg.message_id] = msg
-                elif content_type == ContentType.VIDEO:
-                    pending_videos[msg.message_id] = msg
-
-            posts_to_queue = []
-            all_video_ids = sorted(pending_videos.keys())
-
-            for video_id in all_video_ids:
-                video_msg = pending_videos[video_id]
-                closest_image = None
-                closest_distance = float('inf')
-
-                for img_id, img_msg in pending_images.items():
-                    if img_id >= video_id:
-                        continue
-                    distance = video_id - img_id
-                    if distance < closest_distance and distance <= 5:
-                        closest_distance = distance
-                        closest_image = img_msg
-
-                if closest_image:
-                    img_id = closest_image.message_id
-                    posts_to_queue.append([img_id, video_id])
-                    logger.info(f"Found pair: image {img_id}, video {video_id}")
-
-            for msg_ids in posts_to_queue:
-                try:
-                    self.db.add_post(
-                        intake_message_ids=msg_ids,
-                        media_group_id=None,
-                        status="queued"
-                    )
-                    logger.info(f"Queued existing post: {msg_ids}")
-                except Exception as e:
-                    logger.debug(f"Post already exists or error: {e}")
-
-            logger.info(f"Scanned intake: found {len(posts_to_queue)} posts to queue")
-
-        except Exception as e:
-            logger.error(f"Error scanning intake messages: {e}")
+        """
+        Scan existing messages in Intake Channel on startup.
+        Process valid posts (1 image + 1 video) in chronological order.
+        Skip anything already saved in MongoDB.
+        """
+        logger.info(
+            "Skipping historical intake scan: Telegram Bot API does not expose "
+            "channel history to bots. New channel_post updates and MongoDB state "
+            "will continue the queue safely."
+        )
 
     # ==================== COMMANDS ====================
 
