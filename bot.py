@@ -275,12 +275,8 @@ class QueueBot:
         post_id = str(current_post["_id"])
         self.db.mark_done(post_id)
 
-        storage_ids = current_post.get("storage_message_ids", [])
-        if storage_ids:
-            await self._delete_storage_messages(storage_ids)
-
         self.db.clear_current_post()
-        logger.info(f"Post {post_id} marked as done. Storage cleaned. Queue continuing...")
+        logger.info(f"Post {post_id} marked as done. Queue continuing...")
         await self.check_and_send_next()
 
     async def _delete_storage_messages(self, message_ids: List[int]) -> None:
