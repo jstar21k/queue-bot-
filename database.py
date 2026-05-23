@@ -105,7 +105,8 @@ class DatabaseManager:
                  media_group_id: Optional[str],
                  status: str = "queued",
                  storage_message_ids: Optional[List[int]] = None,
-                 media_unique_ids: Optional[List[str]] = None) -> str:
+                 media_unique_ids: Optional[List[str]] = None,
+                 post_label: Optional[str] = None) -> str:
         now = datetime.now(timezone.utc)
         media_unique_key = None
         if media_unique_ids:
@@ -114,6 +115,7 @@ class DatabaseManager:
             "intake_message_ids": intake_message_ids,
             "media_group_id": media_group_id,
             "media_unique_ids": media_unique_ids or [],
+            "post_label": post_label,
             "status": status,
             "storage_message_ids": storage_message_ids or [],
             "created_at": now,

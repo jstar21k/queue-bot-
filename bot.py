@@ -46,6 +46,13 @@ class IntakeHandler:
             return message.video.file_unique_id
         return None
 
+    def _get_post_label(self, *messages: Message) -> Optional[str]:
+        for message in messages:
+            text = (message.caption or "").strip()
+            if text:
+                return text.splitlines()[0].strip()
+        return None
+
     def _find_matching_pair(self, message: Message) -> Optional[int]:
         content_type = message.content_type
         for key in sorted(self.pending_pairs.keys(), reverse=True):
@@ -106,6 +113,7 @@ class IntakeHandler:
                         self._get_file_unique_id(video_msg),
                     ] if uid
                 ],
+                post_label=self._get_post_label(image_msg, video_msg),
                 media_group_id=None
             )
         return False
@@ -159,6 +167,7 @@ class IntakeHandler:
                     self._get_file_unique_id(video_msg),
                 ] if uid
             ],
+            post_label=self._get_post_label(image_msg, video_msg),
             media_group_id=group_id
         )
 
@@ -258,6 +267,7 @@ class QueueBot:
 
     async def queue_post(self, message_ids: List[int],
                          media_unique_ids: Optional[List[str]] = None,
+                         post_label: Optional[str] = None,
                          media_group_id: Optional[str] = None) -> bool:
         try:
             existing_by_message = self.db.find_by_any_intake_id(message_ids)
@@ -282,6 +292,7 @@ class QueueBot:
                 intake_message_ids=message_ids,
                 media_group_id=media_group_id,
                 media_unique_ids=media_unique_ids,
+                post_label=post_label,
                 status="queued"
             )
             logger.info(f"Post queued: {post_id} (IDs: {message_ids})")
