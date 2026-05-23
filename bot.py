@@ -39,6 +39,13 @@ class IntakeHandler:
     def _make_group_key(self, message: Message) -> int:
         return message.message_id
 
+    def _get_file_unique_id(self, message: Message) -> Optional[str]:
+        if message.content_type == ContentType.PHOTO and message.photo:
+            return message.photo[-1].file_unique_id
+        if message.content_type == ContentType.VIDEO and message.video:
+            return message.video.file_unique_id
+        return None
+
     def _find_matching_pair(self, message: Message) -> Optional[int]:
         content_type = message.content_type
         for key in sorted(self.pending_pairs.keys(), reverse=True):
@@ -93,6 +100,12 @@ class IntakeHandler:
             del self.pending_pairs[group_key]
             return await self.bot_instance.queue_post(
                 message_ids=[image_msg.message_id, video_msg.message_id],
+                media_unique_ids=[
+                    uid for uid in [
+                        self._get_file_unique_id(image_msg),
+                        self._get_file_unique_id(video_msg),
+                    ] if uid
+                ],
                 media_group_id=None
             )
         return False
@@ -140,6 +153,12 @@ class IntakeHandler:
         del self.media_groups[group_id]
         return await self.bot_instance.queue_post(
             message_ids=[image_msg.message_id, video_msg.message_id],
+            media_unique_ids=[
+                uid for uid in [
+                    self._get_file_unique_id(image_msg),
+                    self._get_file_unique_id(video_msg),
+                ] if uid
+            ],
             media_group_id=group_id
         )
 
@@ -162,6 +181,7 @@ class QueueBot:
         self.db = DatabaseManager(config)
         self.intake_handler = IntakeHandler(self)
         self.media_group_tasks: Dict[str, asyncio.Task[Any]] = {}
+        self.send_lock = asyncio.Lock()
         self.sent_time: Optional[datetime] = None
         self.is_running = False
         self._setup_handlers()
@@ -237,11 +257,31 @@ class QueueBot:
             self.media_group_tasks.pop(group_id, None)
 
     async def queue_post(self, message_ids: List[int],
+                         media_unique_ids: Optional[List[str]] = None,
                          media_group_id: Optional[str] = None) -> bool:
         try:
+            existing_by_message = self.db.find_by_any_intake_id(message_ids)
+            if existing_by_message:
+                logger.warning(
+                    "Skipping duplicate intake messages %s; already stored in post %s",
+                    message_ids,
+                    existing_by_message.get("_id"),
+                )
+                return False
+
+            existing_by_media = self.db.find_by_media_unique_ids(media_unique_ids)
+            if existing_by_media:
+                logger.warning(
+                    "Skipping duplicate media pair %s; already stored in post %s",
+                    media_unique_ids,
+                    existing_by_media.get("_id"),
+                )
+                return False
+
             post_id = self.db.add_post(
                 intake_message_ids=message_ids,
                 media_group_id=media_group_id,
+                media_unique_ids=media_unique_ids,
                 status="queued"
             )
             logger.info(f"Post queued: {post_id} (IDs: {message_ids})")
@@ -296,35 +336,37 @@ class QueueBot:
     # ==================== QUEUE MANAGEMENT ====================
 
     async def check_and_send_next(self) -> bool:
-        state = self.db.get_state()
-        if state.get("waiting_for_done") and state.get("current_post_id"):
-            logger.info("Already waiting for 'post done', not sending next")
-            return False
+        async with self.send_lock:
+            state = self.db.get_state()
+            if state.get("waiting_for_done") and state.get("current_post_id"):
+                logger.info("Already waiting for 'post done', not sending next")
+                return False
 
-        next_post = self.db.get_oldest_queued()
-        if not next_post:
-            logger.info("No queued posts available")
-            return False
+            next_post = self.db.claim_oldest_queued()
+            if not next_post:
+                logger.info("No queued posts available")
+                return False
 
-        post_id = str(next_post["_id"])
-        logger.info(f"Sending next post to storage: {post_id}")
+            post_id = str(next_post["_id"])
+            logger.info(f"Sending next post to storage: {post_id}")
 
-        success, storage_ids = await self.send_to_storage(next_post)
+            success, storage_ids = await self.send_to_storage(next_post)
 
-        if success:
-            self.db.update_storage_message_ids(post_id, storage_ids)
-            self.db.mark_sent(post_id)
-            self.db.set_waiting(post_id)
+            if success:
+                self.db.update_storage_message_ids(post_id, storage_ids)
+                self.db.mark_sent(post_id)
+                self.db.set_waiting(post_id)
 
-            # Only remove intake messages after the post is safely in Storage.
-            if self.config.delete_intake_messages:
-                await self._delete_messages(next_post.get("intake_message_ids", []))
+                # Only remove intake messages after the post is safely in Storage.
+                if self.config.delete_intake_messages:
+                    await self._delete_messages(next_post.get("intake_message_ids", []))
 
-            self.sent_time = datetime.now(timezone.utc)
-            logger.info(f"Post {post_id} sent to storage (msgs: {storage_ids}), waiting for confirmation")
-            return True
-        else:
-            logger.error(f"Failed to send post {post_id} to storage")
+                self.sent_time = datetime.now(timezone.utc)
+                logger.info(f"Post {post_id} sent to storage (msgs: {storage_ids}), waiting for confirmation")
+                return True
+
+            self.db.mark_failed(post_id, "Failed to forward both intake messages to storage.")
+            logger.error(f"Failed to send post {post_id} to storage; marked failed")
             return False
 
     async def send_to_storage(self, post: Dict[str, Any]) -> Tuple[bool, List[int]]:
@@ -385,6 +427,9 @@ class QueueBot:
 
     async def startup_recovery(self) -> None:
         logger.info("Running startup recovery...")
+        stale_sending_count = self.db.mark_stale_sending_failed()
+        if stale_sending_count:
+            logger.warning("Marked %s stale sending posts as failed", stale_sending_count)
 
         state = self.db.get_state()
         current_post_id = state.get("current_post_id")

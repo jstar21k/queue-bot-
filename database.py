@@ -3,7 +3,7 @@ MongoDB database module for Queue Bot.
 """
 
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Optional, List, Dict, Any
 from urllib.parse import parse_qsl, urlsplit
 
@@ -12,6 +12,7 @@ from pymongo import MongoClient
 from pymongo.collection import Collection
 from pymongo.database import Database
 from pymongo.errors import PyMongoError
+from pymongo import ReturnDocument
 
 from config import BotConfig
 
@@ -96,17 +97,23 @@ class DatabaseManager:
         self.posts.create_index([("created_at", 1)])
         self.posts.create_index([("status", 1)])
         self.posts.create_index([("intake_message_ids", 1)], unique=True, sparse=True)
+        self.posts.create_index([("media_unique_key", 1)], unique=True, sparse=True)
 
     # ==================== POST OPERATIONS ====================
 
     def add_post(self, intake_message_ids: List[int],
                  media_group_id: Optional[str],
                  status: str = "queued",
-                 storage_message_ids: Optional[List[int]] = None) -> str:
+                 storage_message_ids: Optional[List[int]] = None,
+                 media_unique_ids: Optional[List[str]] = None) -> str:
         now = datetime.now(timezone.utc)
+        media_unique_key = None
+        if media_unique_ids:
+            media_unique_key = "|".join(sorted(media_unique_ids))
         doc = {
             "intake_message_ids": intake_message_ids,
             "media_group_id": media_group_id,
+            "media_unique_ids": media_unique_ids or [],
             "status": status,
             "storage_message_ids": storage_message_ids or [],
             "created_at": now,
@@ -114,12 +121,38 @@ class DatabaseManager:
             "sent_at": None,
             "done_at": None
         }
+        if media_unique_key:
+            doc["media_unique_key"] = media_unique_key
         result = self.posts.insert_one(doc)
         logger.info(f"Added new post to queue: {result.inserted_id}")
         return str(result.inserted_id)
 
     def get_oldest_queued(self) -> Optional[Dict[str, Any]]:
         return self.posts.find_one({"status": "queued"}, sort=[("created_at", 1)])
+
+    def claim_oldest_queued(self) -> Optional[Dict[str, Any]]:
+        now = datetime.now(timezone.utc)
+        return self.posts.find_one_and_update(
+            {"status": "queued"},
+            {"$set": {"status": "sending", "claimed_at": now, "updated_at": now}},
+            sort=[("created_at", 1)],
+            return_document=ReturnDocument.AFTER,
+        )
+
+    def find_by_any_intake_id(self, intake_message_ids: List[int]) -> Optional[Dict[str, Any]]:
+        return self.posts.find_one(
+            {"intake_message_ids": {"$in": intake_message_ids}},
+            {"_id": 1, "status": 1, "intake_message_ids": 1},
+        )
+
+    def find_by_media_unique_ids(self, media_unique_ids: Optional[List[str]]) -> Optional[Dict[str, Any]]:
+        if not media_unique_ids:
+            return None
+        media_unique_key = "|".join(sorted(media_unique_ids))
+        return self.posts.find_one(
+            {"media_unique_key": media_unique_key},
+            {"_id": 1, "status": 1, "media_unique_key": 1},
+        )
 
     def get_post_by_id(self, post_id: str) -> Optional[Dict[str, Any]]:
         from bson import ObjectId
@@ -148,6 +181,23 @@ class DatabaseManager:
             {"$set": {"status": "done", "done_at": datetime.now(timezone.utc), "updated_at": datetime.now(timezone.utc)}}
         )
         return result.modified_count > 0
+
+    def mark_failed(self, post_id: str, reason: str) -> bool:
+        from bson import ObjectId
+        result = self.posts.update_one(
+            {"_id": ObjectId(post_id)},
+            {"$set": {"status": "failed", "failed_at": datetime.now(timezone.utc), "updated_at": datetime.now(timezone.utc), "last_error": reason}}
+        )
+        return result.modified_count > 0
+
+    def mark_stale_sending_failed(self, max_age_minutes: int = 10) -> int:
+        now = datetime.now(timezone.utc)
+        cutoff = now - timedelta(minutes=max_age_minutes)
+        result = self.posts.update_many(
+            {"status": "sending", "updated_at": {"$lt": cutoff}},
+            {"$set": {"status": "failed", "failed_at": now, "updated_at": now, "last_error": "Stale sending claim after restart."}}
+        )
+        return result.modified_count
 
     def get_current_sent(self) -> Optional[Dict[str, Any]]:
         return self.posts.find_one({"status": "sent"})
